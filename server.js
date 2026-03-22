@@ -1,54 +1,66 @@
 const express = require('express');
 const cors = require('cors');
-const { MongoClient } = require('mongodb');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const MONGO_URL = process.env.MONGO_URL || '';
+const MONGO_URL = process.env.MONGO_URL || process.env.MONGODB_URI || process.env.DATABASE_URL || '';
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// ═══ STATE ═══
 let db = null;
-let useMemory = !MONGO_URL;
+let useMemory = true;
+let connectError = '';
+let mongoUrlStatus = MONGO_URL ? `set (${MONGO_URL.substring(0,30)}...)` : 'NOT SET';
+
 let _businesses = [];
 let _orders = [];
-let connectError = '';
 
-// ═══ CONNECT ═══
 async function connectDB() {
   if (!MONGO_URL) {
-    console.log('❌ No MONGO_URL — using memory');
-    useMemory = true;
+    console.log('❌ MONGO_URL not set');
+    connectError = 'MONGO_URL environment variable not set';
     return;
   }
+  
+  console.log('Connecting to:', MONGO_URL.substring(0, 40) + '...');
+  
   try {
-    console.log('Connecting to MongoDB...');
+    const { MongoClient } = require('mongodb');
     const client = new MongoClient(MONGO_URL, {
-      serverSelectionTimeoutMS: 10000,
-      connectTimeoutMS: 10000,
+      serverSelectionTimeoutMS: 15000,
+      connectTimeoutMS: 15000,
+      socketTimeoutMS: 15000,
     });
+    
     await client.connect();
     db = client.db('deckscrab');
-    // Test connection
     await db.command({ ping: 1 });
-    console.log('✅ MongoDB connected successfully');
+    
     useMemory = false;
+    connectError = '';
+    console.log('✅ MongoDB connected!');
+    
+    // Handle disconnection
+    client.on('close', () => {
+      console.log('MongoDB disconnected');
+      useMemory = true;
+    });
+    
   } catch(e) {
     connectError = e.message;
-    console.log('❌ MongoDB connection failed:', e.message);
-    console.log('Using memory storage as fallback');
     useMemory = true;
+    console.log('❌ MongoDB failed:', e.message);
   }
 }
 
-// ═══ ROUTES ═══
+// ═══ ROOT ═══
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     storage: useMemory ? 'memory' : 'mongodb',
-    mongoUrl: MONGO_URL ? 'set' : 'not set',
+    mongoUrl: mongoUrlStatus,
+    mongoConnected: !useMemory,
     connectError: connectError || null
   });
 });
@@ -68,11 +80,14 @@ app.get('/health', async (req, res) => {
     status: 'ok',
     storage: useMemory ? 'memory' : 'mongodb',
     mongoConnected: !useMemory,
+    mongoUrl: mongoUrlStatus,
     connectError: connectError || null,
     uptime: process.uptime(),
     businesses: bizCount,
     orders: orderCount,
-    pendingOrders: useMemory ? _orders.filter(o=>o.status==='pending').length : 0
+    pendingOrders: useMemory
+      ? _orders.filter(o=>o.status==='pending').length
+      : 0
   });
 });
 
@@ -100,7 +115,6 @@ app.get('/api/businesses', async (req, res) => {
     }
     res.json({ businesses, total: businesses.length });
   } catch(e) {
-    console.error('GET businesses error:', e.message);
     res.json({ businesses: _businesses.slice(0, limit), total: _businesses.length });
   }
 });
@@ -122,36 +136,26 @@ app.get('/api/businesses/:id', async (req, res) => {
 
 app.post('/api/businesses', async (req, res) => {
   const bizId = req.body.bizId || 'BIZ-' + Date.now();
-  const business = {
-    ...req.body,
-    id: req.body.id || bizId,
-    bizId,
-    createdAt: req.body.createdAt || Date.now()
-  };
+  const business = { ...req.body, id: req.body.id || bizId, bizId, createdAt: req.body.createdAt || Date.now() };
   try {
     if (!useMemory && db) {
       const existing = await db.collection('businesses').findOne({
         $or: [{ id: business.id }, { bizId: business.bizId }]
       });
       if (existing) {
-        await db.collection('businesses').updateOne(
-          { _id: existing._id },
-          { $set: { ...business, updatedAt: Date.now() } }
-        );
-        res.json({ ok: true, bizId: existing.bizId || bizId, id: existing.id || bizId, updated: true });
+        await db.collection('businesses').updateOne({ _id: existing._id }, { $set: { ...business, updatedAt: Date.now() } });
+        res.json({ ok: true, bizId: existing.bizId, id: existing.id, updated: true });
       } else {
         await db.collection('businesses').insertOne(business);
         res.json({ ok: true, bizId, id: bizId });
       }
     } else {
       const idx = _businesses.findIndex(x => x.id === business.id || x.bizId === business.bizId);
-      if (idx >= 0) _businesses[idx] = business;
-      else _businesses.unshift(business);
+      if (idx >= 0) _businesses[idx] = business; else _businesses.unshift(business);
       if (_businesses.length > 1000) _businesses.splice(1000);
       res.json({ ok: true, bizId, id: bizId });
     }
   } catch(e) {
-    console.error('POST business error:', e.message);
     _businesses.unshift(business);
     res.json({ ok: true, bizId, id: bizId, fallback: true });
   }
@@ -175,9 +179,7 @@ app.patch('/api/businesses/:id', async (req, res) => {
 app.delete('/api/businesses/:id', async (req, res) => {
   try {
     if (!useMemory && db) {
-      await db.collection('businesses').deleteOne({
-        $or: [{ id: req.params.id }, { bizId: req.params.id }]
-      });
+      await db.collection('businesses').deleteOne({ $or: [{ id: req.params.id }, { bizId: req.params.id }] });
     } else {
       _businesses = _businesses.filter(x => x.id !== req.params.id && x.bizId !== req.params.id);
     }
@@ -208,12 +210,7 @@ app.get('/api/orders', async (req, res) => {
 });
 
 app.post('/api/orders', async (req, res) => {
-  const order = {
-    ...req.body,
-    _serverId: 'ORD-' + Date.now(),
-    serverCreatedAt: Date.now(),
-    status: req.body.status || 'pending'
-  };
+  const order = { ...req.body, _serverId: 'ORD-' + Date.now(), serverCreatedAt: Date.now(), status: req.body.status || 'pending' };
   try {
     if (!useMemory && db) {
       const existing = await db.collection('orders').findOne({ orderId: order.orderId });
@@ -247,9 +244,7 @@ app.patch('/api/orders/:id', async (req, res) => {
 app.delete('/api/orders/:id', async (req, res) => {
   try {
     if (!useMemory && db) {
-      await db.collection('orders').deleteOne({
-        $or: [{ id: req.params.id }, { orderId: req.params.id }]
-      });
+      await db.collection('orders').deleteOne({ $or: [{ id: req.params.id }, { orderId: req.params.id }] });
     } else {
       _orders = _orders.filter(x => x.id !== req.params.id && x.orderId !== req.params.id);
     }
@@ -260,6 +255,6 @@ app.delete('/api/orders/:id', async (req, res) => {
 // ═══ START ═══
 connectDB().then(() => {
   app.listen(PORT, () => {
-    console.log(`Deckscrab API on port ${PORT} | Storage: ${useMemory ? 'MEMORY' : 'MONGODB'}`);
+    console.log(`Deckscrab API port ${PORT} | ${useMemory ? 'MEMORY' : 'MONGODB'}`);
   });
 });
