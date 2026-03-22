@@ -1,187 +1,223 @@
 const express = require('express');
 const cors = require('cors');
+
+let MongoClient;
+let db;
+let useMemory = false;
+
+try {
+  MongoClient = require('mongodb').MongoClient;
+} catch(e) {
+  useMemory = true;
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
+const MONGO_URL = process.env.MONGO_URL || process.env.MONGODB_URI || '';
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// ═══ IN-MEMORY STORAGE ═══
-let businesses = [];
-let orders = [];
+let _businesses = [];
+let _orders = [];
 
-// ═══ ROOT ═══
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'Deckscrab API running',
-    endpoints: ['/api/businesses', '/api/orders'],
-    businesses: businesses.length,
-    orders: orders.length
-  });
+async function connectDB() {
+  if (!MONGO_URL || useMemory) {
+    console.log('No MONGO_URL — using memory');
+    useMemory = true;
+    return;
+  }
+  try {
+    const client = new MongoClient(MONGO_URL);
+    await client.connect();
+    db = client.db('deckscrab');
+    console.log('✅ MongoDB connected');
+    useMemory = false;
+  } catch(e) {
+    console.log('MongoDB failed:', e.message);
+    useMemory = true;
+  }
+}
+
+app.get('/', (req, res) => res.json({ status: 'ok', storage: useMemory ? 'memory' : 'mongodb' }));
+
+app.get('/health', async (req, res) => {
+  let bizCount = 0, orderCount = 0;
+  try {
+    if (!useMemory && db) {
+      bizCount = await db.collection('businesses').countDocuments();
+      orderCount = await db.collection('orders').countDocuments();
+    } else {
+      bizCount = _businesses.length;
+      orderCount = _orders.length;
+    }
+  } catch(e) {}
+  res.json({ status: 'ok', storage: useMemory ? 'memory' : 'mongodb', uptime: process.uptime(), businesses: bizCount, orders: orderCount });
 });
 
-// ════════════════════════════════
-// BUSINESSES
-// ════════════════════════════════
+// ════ BUSINESSES ════
 
-// GET all businesses
-app.get('/api/businesses', (req, res) => {
-  const limit = parseInt(req.query.limit) || 100;
-  const sector = req.query.sector;
-  const city = req.query.city;
-  const search = req.query.search;
-
-  let result = [...businesses];
-
-  if (sector) result = result.filter(b => 
-    (b.sector||'').toLowerCase().includes(sector.toLowerCase()) ||
-    (b.sectorName||'').toLowerCase().includes(sector.toLowerCase())
-  );
-  if (city) result = result.filter(b => 
-    (b.city||'').toLowerCase().includes(city.toLowerCase())
-  );
-  if (search) result = result.filter(b => 
-    (b.name||'').toLowerCase().includes(search.toLowerCase()) ||
-    (b.description||'').toLowerCase().includes(search.toLowerCase())
-  );
-
-  res.json({ 
-    businesses: result.slice(0, limit),
-    total: result.length
-  });
-});
-
-// GET single business
-app.get('/api/businesses/:id', (req, res) => {
-  const b = businesses.find(x => x.id === req.params.id || x.bizId === req.params.id);
-  if (!b) return res.status(404).json({ error: 'Not found' });
-  res.json(b);
-});
-
-// POST create business
-app.post('/api/businesses', (req, res) => {
-  const bizId = 'BIZ-' + Date.now();
-  const business = {
-    ...req.body,
-    id: bizId,
-    bizId,
-    createdAt: Date.now(),
-    views: 0,
-    rating: 0,
-    reviewCount: 0
-  };
-  businesses.unshift(business);
-  if (businesses.length > 1000) businesses.splice(1000);
-  res.json({ ok: true, bizId, id: bizId });
-});
-
-// PATCH update business
-app.patch('/api/businesses/:id', (req, res) => {
-  const idx = businesses.findIndex(x => x.id === req.params.id || x.bizId === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-  businesses[idx] = { ...businesses[idx], ...req.body, updatedAt: Date.now() };
-  res.json({ ok: true });
-});
-
-// DELETE business
-app.delete('/api/businesses/:id', (req, res) => {
-  const before = businesses.length;
-  businesses = businesses.filter(x => x.id !== req.params.id && x.bizId !== req.params.id);
-  res.json({ ok: true, deleted: before - businesses.length });
-});
-
-// ════════════════════════════════
-// ORDERS — NEW ENDPOINTS
-// ════════════════════════════════
-
-// GET all orders (shopkeeper fetches by shopPhone or shopName)
-app.get('/api/orders', (req, res) => {
+app.get('/api/businesses', async (req, res) => {
   const limit = parseInt(req.query.limit) || 200;
-  const shopPhone = req.query.shopPhone;
-  const shopName = req.query.shopName;
-  const status = req.query.status;
-
-  let result = [...orders];
-
-  if (shopPhone) {
-    const clean = shopPhone.replace(/\D/g, '');
-    result = result.filter(o => (o.shopPhone||'').replace(/\D/g,'') === clean);
+  const search = (req.query.search || '').toLowerCase();
+  try {
+    let businesses;
+    if (!useMemory && db) {
+      let query = {};
+      if (search) query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+        { city: { $regex: search, $options: 'i' } }
+      ];
+      businesses = await db.collection('businesses').find(query).sort({ createdAt: -1 }).limit(limit).toArray();
+    } else {
+      businesses = [..._businesses];
+      if (search) businesses = businesses.filter(b =>
+        (b.name||'').toLowerCase().includes(search) || (b.city||'').toLowerCase().includes(search)
+      );
+      businesses = businesses.slice(0, limit);
+    }
+    res.json({ businesses, total: businesses.length });
+  } catch(e) {
+    res.json({ businesses: _businesses.slice(0, limit), total: _businesses.length });
   }
-  if (shopName) {
-    result = result.filter(o => 
-      (o.shopName||'').toLowerCase().includes(shopName.toLowerCase())
-    );
-  }
-  if (status) {
-    result = result.filter(o => o.status === status);
-  }
+});
 
-  res.json({ 
-    orders: result.slice(0, limit),
-    total: result.length,
-    pending: result.filter(o => o.status === 'pending').length
+app.get('/api/businesses/:id', async (req, res) => {
+  try {
+    let b;
+    if (!useMemory && db) {
+      b = await db.collection('businesses').findOne({ $or: [{ id: req.params.id }, { bizId: req.params.id }] });
+    } else {
+      b = _businesses.find(x => x.id === req.params.id || x.bizId === req.params.id);
+    }
+    if (!b) return res.status(404).json({ error: 'Not found' });
+    res.json(b);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/businesses', async (req, res) => {
+  const bizId = req.body.bizId || 'BIZ-' + Date.now();
+  const business = { ...req.body, id: req.body.id || bizId, bizId, createdAt: Date.now() };
+  try {
+    if (!useMemory && db) {
+      const phone = (business.phone || business.wa || '').replace(/\D/g,'');
+      const existing = phone ? await db.collection('businesses').findOne({
+        $or: [{ id: business.id }, { bizId: business.bizId }, ...(phone?[{phone},{wa:phone}]:[]) ]
+      }) : null;
+      if (existing) {
+        await db.collection('businesses').updateOne({ _id: existing._id }, { $set: { ...business, updatedAt: Date.now() } });
+        res.json({ ok: true, bizId: existing.bizId || bizId, id: existing.id || bizId, updated: true });
+      } else {
+        await db.collection('businesses').insertOne(business);
+        res.json({ ok: true, bizId, id: bizId });
+      }
+    } else {
+      const idx = _businesses.findIndex(x => x.id === business.id || x.bizId === business.bizId);
+      if (idx >= 0) _businesses[idx] = business; else _businesses.unshift(business);
+      if (_businesses.length > 1000) _businesses.splice(1000);
+      res.json({ ok: true, bizId, id: bizId });
+    }
+  } catch(e) {
+    _businesses.unshift(business);
+    res.json({ ok: true, bizId, id: bizId, fallback: true });
+  }
+});
+
+app.patch('/api/businesses/:id', async (req, res) => {
+  try {
+    if (!useMemory && db) {
+      await db.collection('businesses').updateOne(
+        { $or: [{ id: req.params.id }, { bizId: req.params.id }] },
+        { $set: { ...req.body, updatedAt: Date.now() } }
+      );
+    } else {
+      const idx = _businesses.findIndex(x => x.id === req.params.id || x.bizId === req.params.id);
+      if (idx >= 0) _businesses[idx] = { ..._businesses[idx], ...req.body };
+    }
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: true }); }
+});
+
+app.delete('/api/businesses/:id', async (req, res) => {
+  try {
+    if (!useMemory && db) {
+      await db.collection('businesses').deleteOne({ $or: [{ id: req.params.id }, { bizId: req.params.id }] });
+    } else {
+      _businesses = _businesses.filter(x => x.id !== req.params.id && x.bizId !== req.params.id);
+    }
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: true }); }
+});
+
+// ════ ORDERS ════
+
+app.get('/api/orders', async (req, res) => {
+  const limit = parseInt(req.query.limit) || 200;
+  const shopPhone = (req.query.shopPhone || '').replace(/\D/g, '');
+  const shopName = (req.query.shopName || '').toLowerCase();
+  try {
+    let orders;
+    if (!useMemory && db) {
+      let query = {};
+      if (shopPhone) query.shopPhone = { $regex: shopPhone };
+      if (shopName) query.shopName = { $regex: shopName, $options: 'i' };
+      orders = await db.collection('orders').find(query).sort({ createdAt: -1 }).limit(limit).toArray();
+    } else {
+      orders = [..._orders];
+      if (shopPhone) orders = orders.filter(o => (o.shopPhone||'').replace(/\D/g,'') === shopPhone);
+      if (shopName) orders = orders.filter(o => (o.shopName||'').toLowerCase().includes(shopName));
+      orders = orders.slice(0, limit);
+    }
+    res.json({ orders, total: orders.length, pending: orders.filter(o => o.status === 'pending').length });
+  } catch(e) { res.json({ orders: [], total: 0, pending: 0 }); }
+});
+
+app.post('/api/orders', async (req, res) => {
+  const order = { ...req.body, _serverId: 'ORD-' + Date.now(), serverCreatedAt: Date.now(), status: req.body.status || 'pending' };
+  try {
+    if (!useMemory && db) {
+      const existing = await db.collection('orders').findOne({ orderId: order.orderId });
+      if (!existing) await db.collection('orders').insertOne(order);
+    } else {
+      const exists = _orders.find(o => o.orderId === order.orderId);
+      if (!exists) { _orders.unshift(order); if (_orders.length > 1000) _orders.splice(1000); }
+    }
+    res.json({ ok: true, id: order._serverId, orderId: order.orderId });
+  } catch(e) {
+    _orders.unshift(order);
+    res.json({ ok: true, fallback: true });
+  }
+});
+
+app.patch('/api/orders/:id', async (req, res) => {
+  try {
+    if (!useMemory && db) {
+      await db.collection('orders').updateOne(
+        { $or: [{ id: req.params.id }, { _serverId: req.params.id }, { orderId: req.params.id }] },
+        { $set: { ...req.body, updatedAt: Date.now() } }
+      );
+    } else {
+      const o = _orders.find(x => x.id === req.params.id || x.orderId === req.params.id);
+      if (o) Object.assign(o, req.body);
+    }
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: true }); }
+});
+
+app.delete('/api/orders/:id', async (req, res) => {
+  try {
+    if (!useMemory && db) {
+      await db.collection('orders').deleteOne({ $or: [{ id: req.params.id }, { orderId: req.params.id }] });
+    } else {
+      _orders = _orders.filter(x => x.id !== req.params.id && x.orderId !== req.params.id);
+    }
+    res.json({ ok: true });
+  } catch(e) { res.json({ ok: true }); }
+});
+
+connectDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Deckscrab API on port ${PORT} | Storage: ${useMemory ? 'MEMORY' : 'MONGODB'}`);
   });
-});
-
-// GET single order
-app.get('/api/orders/:id', (req, res) => {
-  const o = orders.find(x => x.id === req.params.id || x.orderId === req.params.id);
-  if (!o) return res.status(404).json({ error: 'Not found' });
-  res.json(o);
-});
-
-// POST create order (called when customer places order)
-app.post('/api/orders', (req, res) => {
-  // Don't store OTP on server for security — only used for cross-device sync
-  const { otp, ...safeOrder } = req.body;
-  const order = {
-    ...safeOrder,
-    _id: 'ORD-' + Date.now(),
-    otp, // still store otp so shopkeeper can verify
-    status: req.body.status || 'pending',
-    serverCreatedAt: Date.now()
-  };
-  orders.unshift(order);
-  if (orders.length > 1000) orders.splice(1000);
-  res.json({ ok: true, id: order._id, orderId: order.orderId });
-});
-
-// PATCH update order status (confirm / reject)
-app.patch('/api/orders/:id', (req, res) => {
-  const o = orders.find(x => 
-    x.id === req.params.id || 
-    x._id === req.params.id || 
-    x.orderId === req.params.id
-  );
-  if (!o) return res.status(404).json({ error: 'Not found' });
-  Object.assign(o, req.body, { updatedAt: Date.now() });
-  res.json({ ok: true, order: o });
-});
-
-// DELETE order
-app.delete('/api/orders/:id', (req, res) => {
-  const before = orders.length;
-  orders = orders.filter(x => 
-    x.id !== req.params.id && 
-    x._id !== req.params.id && 
-    x.orderId !== req.params.id
-  );
-  res.json({ ok: true, deleted: before - orders.length });
-});
-
-// ════════════════════════════════
-// HEALTH CHECK
-// ════════════════════════════════
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    uptime: process.uptime(),
-    businesses: businesses.length,
-    orders: orders.length,
-    pendingOrders: orders.filter(o => o.status === 'pending').length
-  });
-});
-
-app.listen(PORT, () => {
-  console.log(`Deckscrab API running on port ${PORT}`);
 });
